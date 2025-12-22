@@ -25,9 +25,23 @@ struct Snippet: Identifiable, Codable, Equatable, Hashable {
 
 @MainActor
 final class SnippetStore: ObservableObject {
-    @Published var snippets: [Snippet] = []
+    @Published var snippets: [Snippet] = [] {
+        didSet {
+            if !suppressSaveDuringLoad {
+                save()
+            }
+        }
+    }
 
     private let fileName = "snippets.json"
+    private var fileMonitor: DispatchSourceFileSystemObject?
+    private var fileDescriptor: CInt = -1
+    private let fileMonitorQueue = DispatchQueue(label: "SnippetStoreFileMonitor")
+    private var suppressSaveDuringLoad = false
+
+    init() {
+        setupFileMonitor()
+    }
 
     private var snippetsFileURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -38,6 +52,8 @@ final class SnippetStore: ObservableObject {
 
     func load() {
         let url = snippetsFileURL
+        suppressSaveDuringLoad = true
+        defer { suppressSaveDuringLoad = false }
         do {
             let data = try Data(contentsOf: url)
             let decoded = try JSONDecoder().decode([Snippet].self, from: data)
@@ -73,6 +89,45 @@ final class SnippetStore: ObservableObject {
     private func ensureAppSupportDirectoryExists(for fileURL: URL) throws {
         let dir = fileURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    }
+
+    deinit {
+        fileMonitor?.cancel()
+    }
+
+    private func setupFileMonitor() {
+        let url = snippetsFileURL
+
+        do {
+            try ensureAppSupportDirectoryExists(for: url)
+        } catch {
+            // If we can't create the directory, skip installing the monitor.
+            return
+        }
+
+        let descriptor = open(url.deletingLastPathComponent().path, O_EVTONLY)
+        guard descriptor >= 0 else { return }
+        fileDescriptor = descriptor
+
+        let source = DispatchSource.makeFileSystemObjectSource(fileDescriptor: descriptor, eventMask: [.write, .delete, .extend, .attrib, .link, .rename, .revoke], queue: fileMonitorQueue)
+
+        source.setEventHandler { [weak self] in
+            guard let self else { return }
+
+            Task { @MainActor [weak self] in
+                self?.load()
+            }
+        }
+
+        source.setCancelHandler { [weak self] in
+            if let fd = self?.fileDescriptor, fd >= 0 {
+                close(fd)
+                self?.fileDescriptor = -1
+            }
+        }
+
+        fileMonitor = source
+        source.resume()
     }
 }
 
@@ -198,12 +253,6 @@ final class AppState: ObservableObject {
         loadSettings()
         loadStats()
         snippetStore.load()
-        snippetStore.$snippets
-            .dropFirst()
-            .sink { [weak self] _ in
-                self?.snippetStore.save()
-            }
-            .store(in: &cancellables)
 
         // Apply loaded settings to published properties
         self.soundEnabled = loadedSettings.soundEnabled
