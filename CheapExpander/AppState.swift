@@ -87,8 +87,10 @@ final class SnippetStore: ObservableObject {
         }
     }
 
-    func add() {
-        snippets.append(Snippet(trigger: "", expansion: "", isEnabled: true))
+    func add(startDelimiter: String, endAnchors: Set<Character>) {
+        let defaultAnchor = endAnchors.sorted().first ?? "/"
+        let defaultTrigger = startDelimiter + defaultAnchor
+        snippets.append(Snippet(trigger: defaultTrigger, expansion: "", isEnabled: true))
     }
 
     func delete(_ snippet: Snippet) {
@@ -559,6 +561,26 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func normalizedTrigger(_ raw: String) -> String? {
+        var candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidate.isEmpty else { return nil }
+
+        if !candidate.hasPrefix(startDelimiter) {
+            candidate = startDelimiter + candidate
+        }
+
+        if let last = candidate.last, !endAnchors.contains(last) {
+            if let defaultAnchor = endAnchors.sorted().first {
+                candidate.append(defaultAnchor)
+            }
+        }
+
+        guard let last = candidate.last, endAnchors.contains(last) else { return nil }
+        guard candidate.count > startDelimiter.count else { return nil }
+
+        return candidate
+    }
+
     private func evaluateMatches() {
         matchArmed = false
         lastMatchTrigger = ""
@@ -583,8 +605,14 @@ final class AppState: ObservableObject {
             .sorted { $0.trigger.count > $1.trigger.count }
 
         for snip in enabled {
-            let trig = snip.trigger
-            guard trig.hasPrefix(startDelimiter), let end = trig.last, endAnchors.contains(end) else { continue }
+            guard let trig = normalizedTrigger(snip.trigger) else {
+                if debugLogMatching {
+                    let anchors = String(endAnchors.sorted())
+                    NSLog("[Match] skipping trigger=\"\(snip.trigger)\" (must start with \"\(startDelimiter)\" and end with one of \"\(anchors)\")")
+                }
+                continue
+            }
+
             if text.hasSuffix(trig) {
                 // Boundary rule: character before trigger start must be boundary or start of buffer
                 if let startIndex = text.index(text.endIndex, offsetBy: -trig.count, limitedBy: text.startIndex) {
@@ -597,6 +625,7 @@ final class AppState: ObservableObject {
                         lastMatchAt = Date()
                         matchArmed = true
                         if debugLogKeys || debugLogMatching {
+                            let end = trig.last ?? "?"
                             let bufferEscaped = text.replacingOccurrences(of: "\n", with: "\\n")
                             NSLog("[Match] trigger=\"\(trig)\" anchor=\"\(end)\" buffer=\"\(bufferEscaped)\" expansion=\"\(snip.expansion)\" overwrite=\(allowedByOverwrite)")
                         }

@@ -22,6 +22,23 @@ struct SettingsView: View {
         return parts.isEmpty ? "[]" : "[" + parts.joined(separator: ",") + "]"
     }
 
+    private func normalizeTriggerInput(_ raw: String) -> String {
+        var candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidate.isEmpty else { return "" }
+
+        if !candidate.hasPrefix(appState.startDelimiter) {
+            candidate = appState.startDelimiter + candidate
+        }
+
+        if let last = candidate.last, !appState.endAnchors.contains(last) {
+            if let anchor = appState.endAnchors.sorted().first {
+                candidate.append(anchor)
+            }
+        }
+
+        return candidate
+    }
+
     var body: some View {
         Form {
             Section("Status") {
@@ -91,7 +108,7 @@ struct SettingsView: View {
                     Text("Snippets")
                         .font(.headline)
                     Spacer()
-                    Button("Add") { appState.snippetStore.add() }
+                    Button("Add") { appState.snippetStore.add(startDelimiter: appState.startDelimiter, endAnchors: appState.endAnchors) }
                 }
 
                 if appState.snippetStore.snippets.isEmpty {
@@ -106,7 +123,10 @@ struct SettingsView: View {
                                         .toggleStyle(.switch)
                                         .labelsHidden()
 
-                                    TextField("Trigger", text: $snippet.trigger)
+                                    TextField("Trigger", text: Binding(
+                                        get: { snippet.trigger },
+                                        set: { snippet.trigger = normalizeTriggerInput($0) }
+                                    ))
                                         .textFieldStyle(.roundedBorder)
                                         .frame(width: 140)
 
@@ -139,6 +159,9 @@ struct SettingsView: View {
 
                 Text("Saved to Application Support as snippets.json")
                     .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Triggers auto-format to start with \"\(appState.startDelimiter)\" and end with \(String(appState.endAnchors.sorted())) to match expansions.")
+                    .font(.caption2)
                     .foregroundStyle(.secondary)
             }
 
