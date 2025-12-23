@@ -371,6 +371,7 @@ final class AppState: ObservableObject {
     @Published var justMovedCaret: Bool = false
     @Published var debugLogKeys: Bool = false
     @Published var keyMonitorStatus: String = "Stopped"
+    @Published var debugUIActive: Bool = false
 
     // Part 4: Buffer & Matching
     @Published var debugLogMatching: Bool = false
@@ -389,15 +390,28 @@ final class AppState: ObservableObject {
 
     private var suppressMatchOnce: Bool = false
     private var performingReplacement: Bool = false
+    private var matchRequiresSelection: Bool = false
 
     private var buffer = InputBuffer()
     // private var triggers: [Trigger] = []
+
+    private struct IndexedTrigger {
+        let normalized: String
+        let expansion: String
+        let rawTrigger: String
+    }
+
+    private var triggerIndex: [Character: [IndexedTrigger]] = [:]
 
     // Backing storage for loaded settings/stats before publishing
     private var loadedSettings: AppSettings = AppSettings()
     private var loadedStats: AppStats = AppStats()
 
     private var cancellables: Set<AnyCancellable> = []
+
+    private var debugPublishingEnabled: Bool {
+        debugUIActive || debugLogKeys || debugLogMatching
+    }
 
     // App enablement is gated by Accessibility permission.
     @Published var isEnabled: Bool = true {
@@ -444,6 +458,22 @@ final class AppState: ObservableObject {
 
         // Seed example snippets on first run if none exist
         seedExampleSnippetsIfNeeded()
+
+        rebuildTriggerIndex()
+        snippetStore.$snippets
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.rebuildTriggerIndex() }
+            .store(in: &cancellables)
+
+        $startDelimiter
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.rebuildTriggerIndex() }
+            .store(in: &cancellables)
+
+        $endAnchors
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.rebuildTriggerIndex() }
+            .store(in: &cancellables)
 
         self.totalSuccessfulExpansions = loadedStats.totalSuccessfulExpansions
         self.perTriggerUsageCounts = loadedStats.perTriggerUsageCounts
@@ -524,8 +554,7 @@ final class AppState: ObservableObject {
         if lastHasSelection != sel {
             lastHasSelection = sel
             buffer.invalidate()
-            bufferString = buffer.contents.replacingOccurrences(of: "\n", with: "\\n")
-            bufferLength = buffer.contents.count
+            publishBufferState()
         }
     }
 
@@ -566,6 +595,21 @@ final class AppState: ObservableObject {
         refreshPermissions()
     }
 
+    private func publishKeyDebug(_ decoded: KeyEventMonitor.DecodedKey) {
+        guard debugPublishingEnabled else { return }
+        lastKeyString = decoded.characters ?? ""
+        lastKeyCode = UInt16(decoded.keyCode)
+        lastModifiers = decoded.modifiers
+        justDeleted = decoded.isBackspace || decoded.isDeleteForward
+        justMovedCaret = decoded.isArrow
+    }
+
+    private func publishBufferState() {
+        guard debugPublishingEnabled else { return }
+        bufferString = buffer.contents.replacingOccurrences(of: "\n", with: "\\n")
+        bufferLength = buffer.contents.count
+    }
+
     private func setupKeyMonitor() {
         let debugLogKeys = self.debugLogKeys
 
@@ -583,31 +627,21 @@ final class AppState: ObservableObject {
         keyMonitor.onKeyDown = { [weak self] decoded in
             guard let self else { return }
             if self.performingReplacement { return }
-            // Update debug observables
-            self.lastKeyString = decoded.characters ?? ""
-            self.lastKeyCode = UInt16(decoded.keyCode)
-            self.lastModifiers = decoded.modifiers
-
-            // Track context flags for later parts
-            self.justDeleted = decoded.isBackspace || decoded.isDeleteForward
-            self.justMovedCaret = decoded.isArrow
-
-            // Update AX selection state (Part 6)
-            self.updateSelectionState()
+            self.publishKeyDebug(decoded)
 
             // Invalidate buffer and clear match state for command/control shortcuts (navigation/selection changes)
             if decoded.modifiers.contains(.command) || decoded.modifiers.contains(.control) {
                 self.buffer.invalidate()
                 // Publish buffer state after invalidation
-                self.bufferString = self.buffer.contents.replacingOccurrences(of: "\n", with: "\\n")
-                self.bufferLength = self.buffer.contents.count
+                self.publishBufferState()
                 // Clear any armed match
                 self.matchArmed = false
+                self.matchRequiresSelection = false
                 self.lastMatchTrigger = ""
                 self.lastMatchExpansion = ""
                 if self.debugLogKeys {
                     let mods = formatModifiers(decoded.modifiers)
-                    NSLog("[KeyEvent] (cmd/ctrl -> invalidate buffer) code=\(self.lastKeyCode) mods=\(mods)")
+                    NSLog("[KeyEvent] (cmd/ctrl -> invalidate buffer) code=\(decoded.keyCode) mods=\(mods)")
                 }
                 // Do not modify buffer further or evaluate matches
                 return
@@ -624,14 +658,13 @@ final class AppState: ObservableObject {
             }
 
             // Publish buffer state
-            self.bufferString = self.buffer.contents.replacingOccurrences(of: "\n", with: "\\n")
-            self.bufferLength = self.buffer.contents.count
+            self.publishBufferState()
 
             // Log the key event before evaluating matches so ordering is clear
             if self.debugLogKeys {
-                let chars = self.lastKeyString.isEmpty ? "nil" : self.lastKeyString
-                let mods = formatModifiers(self.lastModifiers)
-                NSLog("[KeyEvent] code=\(self.lastKeyCode) chars=\(chars) mods=\(mods) deleted=\(self.justDeleted) arrow=\(self.justMovedCaret)")
+                let chars = decoded.characters ?? "nil"
+                let mods = formatModifiers(decoded.modifiers)
+                NSLog("[KeyEvent] code=\(decoded.keyCode) chars=\(chars) mods=\(mods) deleted=\(decoded.isBackspace || decoded.isDeleteForward) arrow=\(decoded.isArrow)")
             }
 
             // Now evaluate matches
@@ -700,8 +733,15 @@ final class AppState: ObservableObject {
 
     private func performReplacement(triggerRaw: String, expansion: String) {
         guard !triggerRaw.isEmpty else { return }
-        performingReplacement = true
+        updateSelectionState()
         let allowedByOverwrite = axSelectionAvailable && hasSelection
+        if matchRequiresSelection && !allowedByOverwrite {
+            matchArmed = false
+            lastMatchTrigger = ""
+            lastMatchExpansion = ""
+            return
+        }
+        performingReplacement = true
         if debugLogMatching || debugLogKeys {
             NSLog("[Replace] deleting \(triggerRaw.count) chars, inserting \(expansion.count) chars overwrite=\(allowedByOverwrite)")
         }
@@ -714,9 +754,9 @@ final class AppState: ObservableObject {
             // 3) Reset buffer and match state, and suppress next match once
             self.suppressMatchOnce = true
             self.buffer.invalidate()
-            self.bufferString = self.buffer.contents.replacingOccurrences(of: "\n", with: "\\n")
-            self.bufferLength = self.buffer.contents.count
+            self.publishBufferState()
             self.matchArmed = false
+            self.matchRequiresSelection = false
             self.lastMatchTrigger = ""
             self.lastMatchExpansion = ""
             // 4) End replacement after a short window
@@ -748,8 +788,30 @@ final class AppState: ObservableObject {
         return candidate
     }
 
+    private func rebuildTriggerIndex() {
+        let anchors: Set<Character> = endAnchors.isEmpty ? ["/"] : endAnchors
+        var newIndex: [Character: [IndexedTrigger]] = [:]
+
+        let enabled = snippetStore.snippets
+            .filter { $0.isEnabled }
+
+        for snip in enabled {
+            guard let trig = normalizedTrigger(snip.trigger), let anchor = trig.last else { continue }
+            var arr = newIndex[anchor] ?? []
+            arr.append(IndexedTrigger(normalized: trig, expansion: snip.expansion, rawTrigger: snip.trigger))
+            newIndex[anchor] = arr
+        }
+
+        for (anchor, arr) in newIndex {
+            newIndex[anchor] = arr.sorted { $0.normalized.count > $1.normalized.count }
+        }
+
+        triggerIndex = newIndex
+    }
+
     private func evaluateMatches() {
         matchArmed = false
+        matchRequiresSelection = false
         lastMatchTrigger = ""
         lastMatchExpansion = ""
 
@@ -764,40 +826,34 @@ final class AppState: ObservableObject {
         }
 
         let text = buffer.contents
-        guard !text.isEmpty else { return }
+        guard let lastChar = text.last else { return }
 
-        // Evaluate snippets whose trigger starts with the configured delimiter and ends with an allowed end anchor
-        let enabled = snippetStore.snippets
-            .filter { $0.isEnabled }
-            .sorted { $0.trigger.count > $1.trigger.count }
+        let anchors: Set<Character> = endAnchors.isEmpty ? ["/"] : endAnchors
+        guard anchors.contains(lastChar) else { return }
+        guard let candidates = triggerIndex[lastChar], !candidates.isEmpty else { return }
 
-        for snip in enabled {
-            guard let trig = normalizedTrigger(snip.trigger) else {
-                if debugLogMatching {
-                    let anchors = String(endAnchors.sorted())
-                    NSLog("[Match] skipping trigger=\"\(snip.trigger)\" (must start with \"\(startDelimiter)\" and end with one of \"\(anchors)\")")
-                }
-                continue
-            }
-
+        for candidate in candidates {
+            let trig = candidate.normalized
             if text.hasSuffix(trig) {
-                // Boundary rule: character before trigger start must be boundary or start of buffer
                 if let startIndex = text.index(text.endIndex, offsetBy: -trig.count, limitedBy: text.startIndex) {
                     let isAtStart = startIndex == text.startIndex
                     let beforeChar: Character? = isAtStart ? nil : text[text.index(before: startIndex)]
-                    let allowedByOverwrite = axSelectionAvailable && hasSelection
-                    if isAtStart || isBoundary(beforeChar) || allowedByOverwrite {
-                        lastMatchTrigger = trig
-                        lastMatchExpansion = snip.expansion
-                        lastMatchAt = Date()
-                        matchArmed = true
-                        if debugLogKeys || debugLogMatching {
-                            let end = trig.last ?? "?"
-                            let bufferEscaped = text.replacingOccurrences(of: "\n", with: "\\n")
-                            NSLog("[Match] trigger=\"\(trig)\" anchor=\"\(end)\" buffer=\"\(bufferEscaped)\" expansion=\"\(snip.expansion)\" overwrite=\(allowedByOverwrite)")
+                    let boundaryOK = isAtStart || isBoundary(beforeChar)
+                    matchRequiresSelection = !boundaryOK
+                    lastMatchTrigger = trig
+                    lastMatchExpansion = candidate.expansion
+                    lastMatchAt = Date()
+                    matchArmed = boundaryOK || matchRequiresSelection
+                    if debugLogKeys || debugLogMatching {
+                        let bufferEscaped = text.replacingOccurrences(of: "\n", with: "\\n")
+                        let anchor = trig.last ?? "?"
+                        if boundaryOK {
+                            NSLog("[Match] trigger=\"\(trig)\" anchor=\"\(anchor)\" buffer=\"\(bufferEscaped)\" expansion=\"\(candidate.expansion)\" overwritePending=false")
+                        } else {
+                            NSLog("[Match] trigger=\"\(trig)\" anchor=\"\(anchor)\" buffer=\"\(bufferEscaped)\" expansion=\"\(candidate.expansion)\" overwritePending=true")
                         }
-                        return
                     }
+                    return
                 }
             }
         }
