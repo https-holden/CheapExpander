@@ -35,7 +35,7 @@ final class KeyEventMonitor {
 
         if isRunning { return }
 
-        let events: [CGEventType] = [.keyDown, .keyUp, .flagsChanged]
+        let events: [CGEventType] = [.keyDown]
         let mask = events.reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) }
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
@@ -43,11 +43,9 @@ final class KeyEventMonitor {
             options: .listenOnly,
             eventsOfInterest: CGEventMask(mask),
             callback: { proxy, type, event, userInfo in
-                guard type == .keyDown || type == .keyUp || type == .flagsChanged else { return Unmanaged.passUnretained(event) }
+                guard type == .keyDown else { return Unmanaged.passUnretained(event) }
                 let monitor = Unmanaged<KeyEventMonitor>.fromOpaque(userInfo!).takeUnretainedValue()
-                if type == .keyDown {
-                    monitor.handle(event: event)
-                }
+                monitor.handle(event: event)
                 return Unmanaged.passUnretained(event)
             },
             userInfo: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque())

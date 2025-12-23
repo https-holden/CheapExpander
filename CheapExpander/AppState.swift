@@ -360,8 +360,8 @@ final class AppState: ObservableObject {
     // Audio players
     private var players: [SoundType: AVAudioPlayer] = [:]
 
-    @Published var startDelimiter: String = ";"
-    @Published var endAnchors: Set<Character> = ["/", "."]
+    @Published var startDelimiter: String = ";" { didSet { rebuildTriggerIndex() } }
+    @Published var endAnchors: Set<Character> = ["/", "."] { didSet { rebuildTriggerIndex() } }
 
     // Debug/Part 3 observables
     @Published var lastKeyString: String = ""
@@ -370,6 +370,7 @@ final class AppState: ObservableObject {
     @Published var justDeleted: Bool = false
     @Published var justMovedCaret: Bool = false
     @Published var debugLogKeys: Bool = false
+    @Published var debugUIActive: Bool = false { didSet { if debugUIActive { publishKeyDebugStateIfNeeded(); publishBufferStateIfNeeded() } } }
     @Published var keyMonitorStatus: String = "Stopped"
 
     // Part 4: Buffer & Matching
@@ -391,13 +392,31 @@ final class AppState: ObservableObject {
     private var performingReplacement: Bool = false
 
     private var buffer = InputBuffer()
-    // private var triggers: [Trigger] = []
+
+    // Debug caches to avoid publishing unless needed
+    private var lastKeyStringCache: String = ""
+    private var lastKeyCodeCache: UInt16 = 0
+    private var lastModifiersCache: NSEvent.ModifierFlags = []
+    private var justDeletedCache: Bool = false
+    private var justMovedCaretCache: Bool = false
+    private var bufferStringCache: String = ""
+    private var bufferLengthCache: Int = 0
+
+    private struct IndexedTrigger {
+        let trigger: String
+        let expansion: String
+    }
+    private var triggerIndex: [Character: [IndexedTrigger]] = [:]
+
+    private var matchRequiresSelection: Bool = false
 
     // Backing storage for loaded settings/stats before publishing
     private var loadedSettings: AppSettings = AppSettings()
     private var loadedStats: AppStats = AppStats()
 
     private var cancellables: Set<AnyCancellable> = []
+
+    private var shouldPublishDebugState: Bool { debugUIActive || debugLogKeys || debugLogMatching }
 
     // App enablement is gated by Accessibility permission.
     @Published var isEnabled: Bool = true {
@@ -445,6 +464,15 @@ final class AppState: ObservableObject {
         // Seed example snippets on first run if none exist
         seedExampleSnippetsIfNeeded()
 
+        // Build initial trigger index and keep it updated
+        rebuildTriggerIndex()
+        snippetStore.$snippets
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                self?.rebuildTriggerIndex()
+            }
+            .store(in: &cancellables)
+
         self.totalSuccessfulExpansions = loadedStats.totalSuccessfulExpansions
         self.perTriggerUsageCounts = loadedStats.perTriggerUsageCounts
         self.lastUsedTrigger = loadedStats.lastUsedTrigger ?? ""
@@ -470,6 +498,36 @@ final class AppState: ObservableObject {
         }
     }
 
+
+    private func publishKeyDebugStateIfNeeded() {
+        guard shouldPublishDebugState else { return }
+        lastKeyString = lastKeyStringCache
+        lastKeyCode = lastKeyCodeCache
+        lastModifiers = lastModifiersCache
+        justDeleted = justDeletedCache
+        justMovedCaret = justMovedCaretCache
+    }
+
+    private func publishBufferStateIfNeeded() {
+        guard shouldPublishDebugState else { return }
+        bufferString = bufferStringCache
+        bufferLength = bufferLengthCache
+    }
+
+    private func cacheKeyDebug(from decoded: KeyEventMonitor.DecodedKey) {
+        lastKeyStringCache = decoded.characters ?? ""
+        lastKeyCodeCache = UInt16(decoded.keyCode)
+        lastModifiersCache = decoded.modifiers
+        justDeletedCache = decoded.isBackspace || decoded.isDeleteForward
+        justMovedCaretCache = decoded.isArrow
+        publishKeyDebugStateIfNeeded()
+    }
+
+    private func cacheBufferDebug() {
+        bufferStringCache = buffer.contents.replacingOccurrences(of: "\n", with: "\\n")
+        bufferLengthCache = buffer.contents.count
+        publishBufferStateIfNeeded()
+    }
 
     private func updateSelectionState() {
         // Default state
@@ -524,8 +582,7 @@ final class AppState: ObservableObject {
         if lastHasSelection != sel {
             lastHasSelection = sel
             buffer.invalidate()
-            bufferString = buffer.contents.replacingOccurrences(of: "\n", with: "\\n")
-            bufferLength = buffer.contents.count
+            cacheBufferDebug()
         }
     }
 
@@ -583,24 +640,14 @@ final class AppState: ObservableObject {
         keyMonitor.onKeyDown = { [weak self] decoded in
             guard let self else { return }
             if self.performingReplacement { return }
-            // Update debug observables
-            self.lastKeyString = decoded.characters ?? ""
-            self.lastKeyCode = UInt16(decoded.keyCode)
-            self.lastModifiers = decoded.modifiers
-
-            // Track context flags for later parts
-            self.justDeleted = decoded.isBackspace || decoded.isDeleteForward
-            self.justMovedCaret = decoded.isArrow
-
-            // Update AX selection state (Part 6)
-            self.updateSelectionState()
+            // Update debug observables (cached to avoid publishing unless needed)
+            self.cacheKeyDebug(from: decoded)
 
             // Invalidate buffer and clear match state for command/control shortcuts (navigation/selection changes)
             if decoded.modifiers.contains(.command) || decoded.modifiers.contains(.control) {
                 self.buffer.invalidate()
                 // Publish buffer state after invalidation
-                self.bufferString = self.buffer.contents.replacingOccurrences(of: "\n", with: "\\n")
-                self.bufferLength = self.buffer.contents.count
+                self.cacheBufferDebug()
                 // Clear any armed match
                 self.matchArmed = false
                 self.lastMatchTrigger = ""
@@ -624,20 +671,32 @@ final class AppState: ObservableObject {
             }
 
             // Publish buffer state
-            self.bufferString = self.buffer.contents.replacingOccurrences(of: "\n", with: "\\n")
-            self.bufferLength = self.buffer.contents.count
+            self.cacheBufferDebug()
 
             // Log the key event before evaluating matches so ordering is clear
             if self.debugLogKeys {
-                let chars = self.lastKeyString.isEmpty ? "nil" : self.lastKeyString
-                let mods = formatModifiers(self.lastModifiers)
-                NSLog("[KeyEvent] code=\(self.lastKeyCode) chars=\(chars) mods=\(mods) deleted=\(self.justDeleted) arrow=\(self.justMovedCaret)")
+                let chars = self.lastKeyStringCache.isEmpty ? "nil" : self.lastKeyStringCache
+                let mods = formatModifiers(self.lastModifiersCache)
+                NSLog("[KeyEvent] code=\(self.lastKeyCodeCache) chars=\(chars) mods=\(mods) deleted=\(self.justDeletedCache) arrow=\(self.justMovedCaretCache)")
             }
 
             // Now evaluate matches
             self.evaluateMatches()
 
             if self.matchArmed {
+                // Refresh AX selection only when we are about to replace
+                self.updateSelectionState()
+                let allowedByOverwrite = self.axSelectionAvailable && self.hasSelection
+                if self.matchRequiresSelection && !allowedByOverwrite {
+                    if self.debugLogMatching || self.debugLogKeys {
+                        NSLog("[Replace] suppressed because selection unavailable")
+                    }
+                    self.matchArmed = false
+                    self.matchRequiresSelection = false
+                    self.lastMatchTrigger = ""
+                    self.lastMatchExpansion = ""
+                    return
+                }
                 let trigger = self.lastMatchTrigger
                 let expansion = self.lastMatchExpansion
                 self.performReplacement(triggerRaw: trigger, expansion: expansion)
@@ -714,8 +773,7 @@ final class AppState: ObservableObject {
             // 3) Reset buffer and match state, and suppress next match once
             self.suppressMatchOnce = true
             self.buffer.invalidate()
-            self.bufferString = self.buffer.contents.replacingOccurrences(of: "\n", with: "\\n")
-            self.bufferLength = self.buffer.contents.count
+            self.cacheBufferDebug()
             self.matchArmed = false
             self.lastMatchTrigger = ""
             self.lastMatchExpansion = ""
@@ -724,6 +782,24 @@ final class AppState: ObservableObject {
                 self.performingReplacement = false
             }
         }
+    }
+
+    private func rebuildTriggerIndex() {
+        let anchors = endAnchors.isEmpty ? ["/"] : endAnchors
+        var newIndex: [Character: [IndexedTrigger]] = [:]
+
+        let enabled = snippetStore.snippets.filter { $0.isEnabled }
+        for snip in enabled {
+            guard let trig = normalizedTrigger(snip.trigger), let last = trig.last else { continue }
+            guard anchors.contains(last) else { continue }
+            newIndex[last, default: []].append(IndexedTrigger(trigger: trig, expansion: snip.expansion))
+        }
+
+        for key in newIndex.keys {
+            newIndex[key]?.sort { $0.trigger.count > $1.trigger.count }
+        }
+
+        triggerIndex = newIndex
     }
 
     private func normalizedTrigger(_ raw: String) -> String? {
@@ -750,6 +826,7 @@ final class AppState: ObservableObject {
 
     private func evaluateMatches() {
         matchArmed = false
+        matchRequiresSelection = false
         lastMatchTrigger = ""
         lastMatchExpansion = ""
 
@@ -766,38 +843,32 @@ final class AppState: ObservableObject {
         let text = buffer.contents
         guard !text.isEmpty else { return }
 
-        // Evaluate snippets whose trigger starts with the configured delimiter and ends with an allowed end anchor
-        let enabled = snippetStore.snippets
-            .filter { $0.isEnabled }
-            .sorted { $0.trigger.count > $1.trigger.count }
+        let anchors: Set<Character> = endAnchors.isEmpty ? ["/"] : endAnchors
+        guard let lastChar = text.last, anchors.contains(lastChar) else { return }
 
-        for snip in enabled {
-            guard let trig = normalizedTrigger(snip.trigger) else {
-                if debugLogMatching {
-                    let anchors = String(endAnchors.sorted())
-                    NSLog("[Match] skipping trigger=\"\(snip.trigger)\" (must start with \"\(startDelimiter)\" and end with one of \"\(anchors)\")")
-                }
-                continue
-            }
+        let candidates = triggerIndex[lastChar] ?? []
+        guard !candidates.isEmpty else { return }
+
+        for snip in candidates {
+            let trig = snip.trigger
 
             if text.hasSuffix(trig) {
                 // Boundary rule: character before trigger start must be boundary or start of buffer
                 if let startIndex = text.index(text.endIndex, offsetBy: -trig.count, limitedBy: text.startIndex) {
                     let isAtStart = startIndex == text.startIndex
                     let beforeChar: Character? = isAtStart ? nil : text[text.index(before: startIndex)]
-                    let allowedByOverwrite = axSelectionAvailable && hasSelection
-                    if isAtStart || isBoundary(beforeChar) || allowedByOverwrite {
-                        lastMatchTrigger = trig
-                        lastMatchExpansion = snip.expansion
-                        lastMatchAt = Date()
-                        matchArmed = true
-                        if debugLogKeys || debugLogMatching {
-                            let end = trig.last ?? "?"
-                            let bufferEscaped = text.replacingOccurrences(of: "\n", with: "\\n")
-                            NSLog("[Match] trigger=\"\(trig)\" anchor=\"\(end)\" buffer=\"\(bufferEscaped)\" expansion=\"\(snip.expansion)\" overwrite=\(allowedByOverwrite)")
-                        }
-                        return
+                    let boundarySatisfied = isAtStart || isBoundary(beforeChar)
+                    lastMatchTrigger = trig
+                    lastMatchExpansion = snip.expansion
+                    lastMatchAt = Date()
+                    matchArmed = true
+                    matchRequiresSelection = !boundarySatisfied
+                    if debugLogKeys || debugLogMatching {
+                        let end = trig.last ?? "?"
+                        let bufferEscaped = text.replacingOccurrences(of: "\n", with: "\\n")
+                        NSLog("[Match] trigger=\"\(trig)\" anchor=\"\(end)\" buffer=\"\(bufferEscaped)\" expansion=\"\(snip.expansion)\" needsSelection=\(matchRequiresSelection)")
                     }
+                    return
                 }
             }
         }

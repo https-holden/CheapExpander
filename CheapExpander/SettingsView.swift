@@ -57,66 +57,70 @@ struct SettingsView: View {
                 appState.beginEditingSettings()
             }
 
-            Section("Status") {
-                LabeledContent("Enabled") {
-                    Text(appState.isEnabled ? "On" : "Off")
+            Group {
+                Section("Status") {
+                    LabeledContent("Enabled") {
+                        Text(appState.isEnabled ? "On" : "Off")
+                    }
+                    LabeledContent("Accessibility") {
+                        Text(appState.accessibilityPermissionGranted ? "Granted" : "Not granted")
+                    }
+                    LabeledContent("Monitor Status") {
+                        Text(appState.keyMonitorStatus)
+                    }
+                    LabeledContent("Debug Log Keys") {
+                        Toggle("", isOn: $appState.debugLogKeys)
+                            .labelsHidden()
+                    }
+                    LabeledContent("Last Key") {
+                        Text(appState.lastKeyString.isEmpty ? "(none)" : appState.lastKeyString)
+                    }
+                    LabeledContent("KeyCode") {
+                        Text("\(appState.lastKeyCode)")
+                    }
+                    LabeledContent("Modifiers") {
+                        Text(formatModifiers(appState.lastModifiers))
+                    }
+                    LabeledContent("justDeleted") {
+                        Text(appState.justDeleted ? "true" : "false")
+                    }
+                    LabeledContent("justMovedCaret") {
+                        Text(appState.justMovedCaret ? "true" : "false")
+                    }
                 }
-                LabeledContent("Accessibility") {
-                    Text(appState.accessibilityPermissionGranted ? "Granted" : "Not granted")
-                }
-                LabeledContent("Monitor Status") {
-                    Text(appState.keyMonitorStatus)
-                }
-                LabeledContent("Debug Log Keys") {
-                    Toggle("", isOn: $appState.debugLogKeys)
-                        .labelsHidden()
-                }
-                LabeledContent("Last Key") {
-                    Text(appState.lastKeyString.isEmpty ? "(none)" : appState.lastKeyString)
-                }
-                LabeledContent("KeyCode") {
-                    Text("\(appState.lastKeyCode)")
-                }
-                LabeledContent("Modifiers") {
-                    Text(formatModifiers(appState.lastModifiers))
-                }
-                LabeledContent("justDeleted") {
-                    Text(appState.justDeleted ? "true" : "false")
-                }
-                LabeledContent("justMovedCaret") {
-                    Text(appState.justMovedCaret ? "true" : "false")
-                }
-            }
 
-            Section("Buffer / Matching") {
-                LabeledContent("Buffer") {
-                    Text(appState.bufferString.isEmpty ? "(empty)" : appState.bufferString)
-                        .font(.system(size: 11, weight: .regular, design: .monospaced))
-                        .lineLimit(6)
-                        .truncationMode(.middle)
-                        .textSelection(.enabled)
-                }
-                LabeledContent("Length") {
-                    Text("\(appState.bufferLength)")
-                }
-                LabeledContent("Match Armed") {
-                    Text(appState.matchArmed ? "true" : "false")
-                }
-                LabeledContent("Last Trigger") {
-                    Text(appState.lastMatchTrigger.isEmpty ? "(none)" : appState.lastMatchTrigger)
-                }
-                LabeledContent("Expansion") {
-                    Text(appState.lastMatchExpansion.isEmpty ? "(none)" : appState.lastMatchExpansion)
-                        .font(.system(size: 11, weight: .regular, design: .monospaced))
-                        .lineLimit(6)
-                        .truncationMode(.middle)
-                        .textSelection(.enabled)
-                }
-                LabeledContent("Log Matching") {
-                    Toggle("", isOn: $appState.debugLogMatching)
-                        .labelsHidden()
+                Section("Buffer / Matching") {
+                    LabeledContent("Buffer") {
+                        Text(appState.bufferString.isEmpty ? "(empty)" : appState.bufferString)
+                            .font(.system(size: 11, weight: .regular, design: .monospaced))
+                            .lineLimit(6)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
+                    LabeledContent("Length") {
+                        Text("\(appState.bufferLength)")
+                    }
+                    LabeledContent("Match Armed") {
+                        Text(appState.matchArmed ? "true" : "false")
+                    }
+                    LabeledContent("Last Trigger") {
+                        Text(appState.lastMatchTrigger.isEmpty ? "(none)" : appState.lastMatchTrigger)
+                    }
+                    LabeledContent("Expansion") {
+                        Text(appState.lastMatchExpansion.isEmpty ? "(none)" : appState.lastMatchExpansion)
+                            .font(.system(size: 11, weight: .regular, design: .monospaced))
+                            .lineLimit(6)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
+                    LabeledContent("Log Matching") {
+                        Toggle("", isOn: $appState.debugLogMatching)
+                            .labelsHidden()
+                    }
                 }
             }
+            .onAppear { appState.debugUIActive = true }
+            .onDisappear { appState.debugUIActive = false }
 
             // MARK: - Part 8: Snippets UI + Persistence
             Section {
