@@ -5,7 +5,7 @@ struct CheapExpanderApp: App {
     @StateObject private var appState = AppState()
 
     var body: some Scene {
-        MenuBarExtra("CheapExpander", systemImage: appState.isEnabled ? "bolt.fill" : "bolt.slash") {
+        MenuBarExtra("CheapExpander", image: "Image") {
             MenuBarView()
                 .environmentObject(appState)
         }
@@ -19,3 +19,4 @@ struct CheapExpanderApp: App {
         .defaultSize(width: 560, height: 600)
     }
 }
+

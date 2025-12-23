@@ -13,6 +13,7 @@ import ApplicationServices
 import Carbon
 import AVFoundation
 import UniformTypeIdentifiers
+import CryptoKit
 
 // MARK: - Snippets (Part 8)
 
@@ -27,7 +28,7 @@ struct Snippet: Identifiable, Codable, Equatable, Hashable {
 final class SnippetStore: ObservableObject {
     @Published var snippets: [Snippet] = [] {
         didSet {
-            if !suppressSaveDuringLoad {
+            if !suppressSaveDuringLoad && !suppressSavesTemporarily {
                 save()
             }
         }
@@ -40,6 +41,11 @@ final class SnippetStore: ObservableObject {
     // Only read/written on fileMonitorQueue
     private var isSavingFromThisProcess = false
     private var suppressSaveDuringLoad = false
+    private var suppressSavesTemporarily = false
+
+    // Debounce and change detection
+    private var pendingReloadWorkItem: DispatchWorkItem?
+    private var lastLoadedFileSignature: (size: UInt64, modDate: Date?, sha1: Data?) = (0, nil, nil)
 
     init() {
         setupFileMonitor()
@@ -57,12 +63,27 @@ final class SnippetStore: ObservableObject {
         suppressSaveDuringLoad = true
         defer { suppressSaveDuringLoad = false }
         do {
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+            let modDate = attrs[.modificationDate] as? Date
             let data = try Data(contentsOf: url)
+            let sha1 = SnippetStore.sha1(of: data)
+
+            // If signature is unchanged, skip reloading
+            if lastLoadedFileSignature.size == size,
+               lastLoadedFileSignature.modDate == modDate,
+               lastLoadedFileSignature.sha1 == sha1 {
+                return
+            }
+
             let decoded = try JSONDecoder().decode([Snippet].self, from: data)
             self.snippets = decoded
+            self.lastLoadedFileSignature = (size, modDate, sha1)
+            NSLog("[Snippets] Loaded %d from %@", decoded.count, url.path)
         } catch {
-            // Non-fatal: treat missing/invalid file as empty.
+            NSLog("[Snippets] Load failed or missing at %@: %@", url.path, String(describing: error))
             self.snippets = []
+            self.lastLoadedFileSignature = (0, nil, nil)
         }
     }
 
@@ -76,23 +97,68 @@ final class SnippetStore: ObservableObject {
         }
 
         do {
+            NSLog("[Snippets] Saving %d to %@", self.snippets.count, url.path)
             try ensureAppSupportDirectoryExists(for: url)
             let data = try JSONEncoder().encode(snippets)
             let tmp = url.appendingPathExtension("tmp")
             try data.write(to: tmp, options: [.atomic])
             _ = try? FileManager.default.removeItem(at: url)
             try FileManager.default.moveItem(at: tmp, to: url)
+
+            let attrs = try FileManager.default.attributesOfItem(atPath: url.path)
+            let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
+            let modDate = attrs[.modificationDate] as? Date
+            let sha1 = SnippetStore.sha1(of: data)
+            self.fileMonitorQueue.async { [size, modDate, sha1] in
+                self.lastLoadedFileSignature = (size, modDate, sha1)
+            }
         } catch {
-            // Non-fatal for now.
+            NSLog("[Snippets] Save failed at %@: %@", url.path, String(describing: error))
         }
     }
 
-    func add() {
-        snippets.append(Snippet(trigger: "", expansion: "", isEnabled: true))
+    func add(startDelimiter: String, endAnchors: Set<Character>) {
+        let defaultAnchor: Character = endAnchors.sorted().first ?? "/"
+        let defaultTrigger = startDelimiter + String(defaultAnchor)
+        snippets.append(Snippet(trigger: defaultTrigger, expansion: "", isEnabled: true))
     }
 
     func delete(_ snippet: Snippet) {
         snippets.removeAll { $0.id == snippet.id }
+    }
+    
+    func exportSnippets() {
+        let panel = NSSavePanel()
+        panel.title = "Export Snippets"
+        panel.nameFieldStringValue = "snippets.json"
+        panel.allowedContentTypes = [UTType.json]
+        if panel.runModal() == .OK, let url = panel.url {
+            do {
+                let data = try JSONEncoder().encode(snippets)
+                try data.write(to: url, options: .atomic)
+                NSLog("[Snippets] Exported %d to %@", snippets.count, url.path)
+            } catch {
+                NSLog("[Snippets] Export failed: %@", String(describing: error))
+            }
+        }
+    }
+
+    func importSnippets() {
+        let panel = NSOpenPanel()
+        panel.title = "Import Snippets"
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [UTType.json]
+        if panel.runModal() == .OK, let url = panel.url {
+            do {
+                let data = try Data(contentsOf: url)
+                let decoded = try JSONDecoder().decode([Snippet].self, from: data)
+                self.snippets = decoded
+                NSLog("[Snippets] Imported %d from %@", decoded.count, url.path)
+            } catch {
+                NSLog("[Snippets] Import failed: %@", String(describing: error))
+            }
+        }
     }
 
     private func ensureAppSupportDirectoryExists(for fileURL: URL) throws {
@@ -100,7 +166,23 @@ final class SnippetStore: ObservableObject {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     }
 
+    // Staging controls: suppress auto-saves while the Settings UI is in edit mode
+    func beginStagedEditing() {
+        suppressSavesTemporarily = true
+    }
+
+    func commitStagedEditing() {
+        suppressSavesTemporarily = false
+        save()
+    }
+
+    func discardStagedEditing() {
+        suppressSavesTemporarily = false
+        load()
+    }
+
     deinit {
+        pendingReloadWorkItem?.cancel()
         fileMonitor?.cancel()
     }
 
@@ -123,13 +205,19 @@ final class SnippetStore: ObservableObject {
         source.setEventHandler { [weak self] in
             guard let self else { return }
 
-            // Ignore events that originate from our own writes to avoid
-            // reloading while bindings are mutating (which could crash the UI).
+            // Ignore events from our own saves
             guard !self.isSavingFromThisProcess else { return }
 
-            Task { @MainActor [weak self] in
-                self?.load()
+            // Debounce multiple rapid events from the directory monitor
+            self.pendingReloadWorkItem?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                Task { @MainActor [weak self] in
+                    self?.load()
+                }
             }
+            self.pendingReloadWorkItem = work
+            self.fileMonitorQueue.asyncAfter(deadline: .now() + 0.2, execute: work)
         }
 
         source.setCancelHandler { [weak self] in
@@ -141,6 +229,15 @@ final class SnippetStore: ObservableObject {
 
         fileMonitor = source
         source.resume()
+    }
+
+    private static func sha1(of data: Data) -> Data? {
+        #if canImport(CryptoKit)
+        let digest = Insecure.SHA1.hash(data: data)
+        return Data(digest)
+        #else
+        return nil
+        #endif
     }
 }
 
@@ -157,6 +254,63 @@ final class AppState: ObservableObject {
         var sound100Filename: String? = nil
         var defaultExpansionSound: SoundType = .b
         var nextABIsA: Bool = false
+        var startDelimiter: String = ";"
+        var endAnchors: [Character] = ["/", "."]
+
+        enum CodingKeys: String, CodingKey {
+            case desiredEnabled
+            case soundEnabled
+            case volume
+            case playHundredth
+            case soundAFilename
+            case soundBFilename
+            case sound100Filename
+            case defaultExpansionSound
+            case nextABIsA
+            case startDelimiter
+            case endAnchors
+        }
+
+        init() {}
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            desiredEnabled = try c.decodeIfPresent(Bool.self, forKey: .desiredEnabled) ?? true
+            soundEnabled = try c.decodeIfPresent(Bool.self, forKey: .soundEnabled) ?? true
+            volume = try c.decodeIfPresent(Double.self, forKey: .volume) ?? 80
+            playHundredth = try c.decodeIfPresent(Bool.self, forKey: .playHundredth) ?? true
+            soundAFilename = try c.decodeIfPresent(String.self, forKey: .soundAFilename)
+            soundBFilename = try c.decodeIfPresent(String.self, forKey: .soundBFilename)
+            sound100Filename = try c.decodeIfPresent(String.self, forKey: .sound100Filename)
+            defaultExpansionSound = try c.decodeIfPresent(SoundType.self, forKey: .defaultExpansionSound) ?? .b
+            nextABIsA = try c.decodeIfPresent(Bool.self, forKey: .nextABIsA) ?? false
+            startDelimiter = try c.decodeIfPresent(String.self, forKey: .startDelimiter) ?? ";"
+
+            // Be permissive: prefer [String], fallback to single String, then default
+            if let strings = try? c.decode([String].self, forKey: .endAnchors) {
+                endAnchors = strings.compactMap { $0.first }
+            } else if let single = try? c.decode(String.self, forKey: .endAnchors) {
+                endAnchors = Array(single)
+            } else {
+                endAnchors = ["/", "."]
+            }
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var c = encoder.container(keyedBy: CodingKeys.self)
+            try c.encode(desiredEnabled, forKey: .desiredEnabled)
+            try c.encode(soundEnabled, forKey: .soundEnabled)
+            try c.encode(volume, forKey: .volume)
+            try c.encode(playHundredth, forKey: .playHundredth)
+            try c.encode(soundAFilename, forKey: .soundAFilename)
+            try c.encode(soundBFilename, forKey: .soundBFilename)
+            try c.encode(sound100Filename, forKey: .sound100Filename)
+            try c.encode(defaultExpansionSound, forKey: .defaultExpansionSound)
+            try c.encode(nextABIsA, forKey: .nextABIsA)
+            try c.encode(startDelimiter, forKey: .startDelimiter)
+            // Encode as [String] for maximum compatibility
+            try c.encode(endAnchors.map { String($0) }, forKey: .endAnchors)
+        }
     }
 
     struct AppStats: Codable {
@@ -185,9 +339,14 @@ final class AppState: ObservableObject {
     @Published var soundAFilename: String? = nil { didSet { rebuildPlayer(for: .a); saveSettings() } }
     @Published var soundBFilename: String? = nil { didSet { rebuildPlayer(for: .b); saveSettings() } }
     @Published var sound100Filename: String? = nil { didSet { rebuildPlayer(for: .hundred); saveSettings() } }
+    @Published var nextABIsA: Bool = true { didSet { saveSettings() } }
+
+    // Staged Settings Editing (defer commits until Save)
+    @Published var isEditingSettings: Bool = false
+    @Published var stagedSettings: AppSettings? = nil
 
     // Legacy alternation state (persisted for backward compatibility; no longer used)
-    @Published var nextABIsA: Bool = true { didSet { saveSettings() } }
+    // ... (rest unchanged)
 
     // Stats (persisted)
     @Published var totalSuccessfulExpansions: Int = 0 { didSet { saveStats() } }
@@ -277,6 +436,14 @@ final class AppState: ObservableObject {
         self.sound100Filename = loadedSettings.sound100Filename
         self.nextABIsA = loadedSettings.nextABIsA
         self.desiredEnabled = loadedSettings.desiredEnabled
+        self.startDelimiter = loadedSettings.startDelimiter
+        self.endAnchors = Set(loadedSettings.endAnchors)
+
+        // Prepare a staged snapshot for immediate editing if the Settings UI binds eagerly
+        self.stagedSettings = makeSettingsFromLive()
+
+        // Seed example snippets on first run if none exist
+        seedExampleSnippetsIfNeeded()
 
         self.totalSuccessfulExpansions = loadedStats.totalSuccessfulExpansions
         self.perTriggerUsageCounts = loadedStats.perTriggerUsageCounts
@@ -559,6 +726,28 @@ final class AppState: ObservableObject {
         }
     }
 
+    private func normalizedTrigger(_ raw: String) -> String? {
+        var candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidate.isEmpty else { return nil }
+
+        if !candidate.hasPrefix(startDelimiter) {
+            candidate = startDelimiter + candidate
+        }
+
+        let anchors: Set<Character> = endAnchors.isEmpty ? ["/"] : endAnchors
+
+        if let last = candidate.last, !anchors.contains(last) {
+            if let defaultAnchor = anchors.sorted().first {
+                candidate.append(defaultAnchor)
+            }
+        }
+
+        guard let last = candidate.last, anchors.contains(last) else { return nil }
+        guard candidate.count > startDelimiter.count else { return nil }
+
+        return candidate
+    }
+
     private func evaluateMatches() {
         matchArmed = false
         lastMatchTrigger = ""
@@ -583,8 +772,14 @@ final class AppState: ObservableObject {
             .sorted { $0.trigger.count > $1.trigger.count }
 
         for snip in enabled {
-            let trig = snip.trigger
-            guard trig.hasPrefix(startDelimiter), let end = trig.last, endAnchors.contains(end) else { continue }
+            guard let trig = normalizedTrigger(snip.trigger) else {
+                if debugLogMatching {
+                    let anchors = String(endAnchors.sorted())
+                    NSLog("[Match] skipping trigger=\"\(snip.trigger)\" (must start with \"\(startDelimiter)\" and end with one of \"\(anchors)\")")
+                }
+                continue
+            }
+
             if text.hasSuffix(trig) {
                 // Boundary rule: character before trigger start must be boundary or start of buffer
                 if let startIndex = text.index(text.endIndex, offsetBy: -trig.count, limitedBy: text.startIndex) {
@@ -597,6 +792,7 @@ final class AppState: ObservableObject {
                         lastMatchAt = Date()
                         matchArmed = true
                         if debugLogKeys || debugLogMatching {
+                            let end = trig.last ?? "?"
                             let bufferEscaped = text.replacingOccurrences(of: "\n", with: "\\n")
                             NSLog("[Match] trigger=\"\(trig)\" anchor=\"\(end)\" buffer=\"\(bufferEscaped)\" expansion=\"\(snip.expansion)\" overwrite=\(allowedByOverwrite)")
                         }
@@ -669,6 +865,8 @@ final class AppState: ObservableObject {
         s.soundBFilename = soundBFilename
         s.sound100Filename = sound100Filename
         s.nextABIsA = nextABIsA
+        s.startDelimiter = startDelimiter
+        s.endAnchors = Array(endAnchors)
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted]
         encoder.dateEncodingStrategy = .iso8601
@@ -678,6 +876,64 @@ final class AppState: ObservableObject {
         } catch {
             NSLog("[Persistence] Failed saving settings: \(error)")
         }
+    }
+
+    // MARK: - Settings Staging & Commit Control
+    private func makeSettingsFromLive() -> AppSettings {
+        var s = AppSettings()
+        s.desiredEnabled = desiredEnabled
+        s.soundEnabled = soundEnabled
+        s.volume = soundVolume
+        s.playHundredth = playHundredth
+        s.defaultExpansionSound = defaultExpansionSound
+        s.soundAFilename = soundAFilename
+        s.soundBFilename = soundBFilename
+        s.sound100Filename = sound100Filename
+        s.nextABIsA = nextABIsA
+        s.startDelimiter = startDelimiter
+        s.endAnchors = Array(endAnchors)
+        return s
+    }
+
+    private func applyLive(from s: AppSettings) {
+        // Assign to live published properties; their didSet hooks will persist via saveSettings()
+        desiredEnabled = s.desiredEnabled
+        soundEnabled = s.soundEnabled
+        soundVolume = s.volume
+        playHundredth = s.playHundredth
+        defaultExpansionSound = s.defaultExpansionSound
+        soundAFilename = s.soundAFilename
+        soundBFilename = s.soundBFilename
+        sound100Filename = s.sound100Filename
+        nextABIsA = s.nextABIsA
+        startDelimiter = s.startDelimiter
+        endAnchors = Set(s.endAnchors)
+    }
+
+    /// Begin an editing session for Settings. Call this when the Settings UI appears.
+    func beginEditingSettings() {
+        isEditingSettings = true
+        stagedSettings = makeSettingsFromLive()
+        // Begin staging snippets as well (defer snippet saves until Save)
+        snippetStore.beginStagedEditing()
+    }
+
+    /// Apply staged settings to live values and persist. Call this from the Save button.
+    func saveSettingsFromUI() {
+        guard let staged = stagedSettings else { return }
+        applyLive(from: staged)
+        // Commit staged snippet changes
+        snippetStore.commitStagedEditing()
+        isEditingSettings = false
+        stagedSettings = nil
+    }
+
+    /// Discard any staged changes. Call this from a Cancel button or when leaving Settings without saving.
+    func discardStagedSettings() {
+        // Discard snippet changes and reset staged app settings
+        snippetStore.discardStagedEditing()
+        isEditingSettings = false
+        stagedSettings = nil
     }
 
     private func saveStats() {
@@ -730,6 +986,32 @@ final class AppState: ObservableObject {
         for (_, p) in players { p.volume = Float(soundVolume / 100.0) }
     }
 
+    // Unified play helper: use AVAudioPlayer if available, otherwise fall back to a system sound
+    private func play(type: SoundType) {
+        if let player = players[type] {
+            player.currentTime = 0
+            player.play()
+            return
+        }
+
+        // Fallback to a system sound if no player is available (e.g., no custom file chosen)
+        let fallbackName: String
+        switch type {
+        case .a:
+            fallbackName = "Pop"
+        case .b:
+            fallbackName = "Glass"
+        case .hundred:
+            fallbackName = "Funk"
+        }
+        if let sound = NSSound(named: NSSound.Name(fallbackName)) {
+            sound.volume = Float(soundVolume / 100.0)
+            sound.play()
+        } else {
+            NSSound.beep()
+        }
+    }
+
     func chooseSound(for type: SoundType) {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
@@ -766,29 +1048,109 @@ final class AppState: ObservableObject {
     }
 
     func playTest(_ type: SoundType) {
-        guard let player = players[type] else { return }
-        player.currentTime = 0
-        player.play()
+        play(type: type)
     }
 
     func revealSoundsFolder() {
         NSWorkspace.shared.activateFileViewerSelecting([soundsFolderURL])
     }
 
+    func revealAppSupportFolder() {
+        NSWorkspace.shared.activateFileViewerSelecting([appSupportURL])
+    }
+
     func resetSoundsToDefaults() {
-        // Remove current filenames and try installing defaults again
-        soundAFilename = nil
-        soundBFilename = nil
-        sound100Filename = nil
-        defaultExpansionSound = .b
-        installDefaultSoundsIfNeeded()
-        rebuildAllPlayers()
+        if stagedSettings != nil {
+            // Adjust staged values only; do not touch live files/players yet
+            stagedSettings?.soundAFilename = nil
+            stagedSettings?.soundBFilename = nil
+            stagedSettings?.sound100Filename = nil
+            stagedSettings?.defaultExpansionSound = .b
+        } else {
+            // Live reset behavior
+            soundAFilename = nil
+            soundBFilename = nil
+            sound100Filename = nil
+            defaultExpansionSound = .b
+            installDefaultSoundsIfNeeded()
+            rebuildAllPlayers()
+        }
     }
 
     private func installDefaultSoundsIfNeeded() {
-        // In sandboxed environments, avoid auto-copying from external folders like Downloads.
-        // End product relies on user-chosen sounds via NSOpenPanel.
-        // If filenames are already set (from a previous run), players will be rebuilt accordingly.
+        // If filenames are missing or files were removed, try to auto-assign from the Sounds folder
+        do {
+            try FileManager.default.createDirectory(at: soundsFolderURL, withIntermediateDirectories: true)
+            let urls = try FileManager.default.contentsOfDirectory(
+                at: soundsFolderURL,
+                includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )
+
+            let audioExts: Set<String> = ["mp3", "m4a", "wav", "aif", "aiff", "caf"]
+            let files = urls.compactMap { url -> URL? in
+                let ext = url.pathExtension.lowercased()
+                guard audioExts.contains(ext) else { return nil }
+                let values = try? url.resourceValues(forKeys: [.isRegularFileKey])
+                guard values?.isRegularFile == true else { return nil }
+                return url
+            }
+
+            func fileMissing(_ filename: String?) -> Bool {
+                guard let filename, !filename.isEmpty else { return true }
+                let url = soundsFolderURL.appendingPathComponent(filename)
+                return !FileManager.default.fileExists(atPath: url.path)
+            }
+
+            func pickCandidate(prefixes: [String]) -> String? {
+                let lowerPrefixes = prefixes.map { $0.lowercased() }
+                let candidates = files.filter { url in
+                    let name = url.lastPathComponent.lowercased()
+                    return lowerPrefixes.contains { prefix in name.hasPrefix(prefix) }
+                }
+                let sorted = candidates.sorted { lhs, rhs in
+                    let lDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                    let rDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                    return lDate ?? .distantPast > rDate ?? .distantPast
+                }
+                return sorted.first?.lastPathComponent
+            }
+
+            if fileMissing(soundAFilename) {
+                if let name = pickCandidate(prefixes: ["Sound_A_", "sound_a_", "a_"]) {
+                    soundAFilename = name
+                }
+            }
+            if fileMissing(soundBFilename) {
+                if let name = pickCandidate(prefixes: ["Sound_B_", "sound_b_", "b_"]) {
+                    soundBFilename = name
+                }
+            }
+            if fileMissing(sound100Filename) {
+                if let name = pickCandidate(prefixes: ["Sound_100_", "sound_100_", "100_"]) {
+                    sound100Filename = name
+                }
+            }
+        } catch {
+            NSLog("[Sound] Failed scanning Sounds folder: \(error)")
+        }
+    }
+
+    // MARK: - Seed Example Snippets
+    private func seedExampleSnippetsIfNeeded() {
+        // Only seed if there are no snippets yet
+        guard snippetStore.snippets.isEmpty else { return }
+        let anchors: Set<Character> = endAnchors.isEmpty ? ["/"] : endAnchors
+        let anchor = anchors.sorted().first ?? "/"
+
+        let emlTrigger = "\(startDelimiter)eml\(anchor)"
+        let sigTrigger = "\(startDelimiter)sig\(anchor)"
+
+        let samples: [Snippet] = [
+            Snippet(trigger: emlTrigger, expansion: "user@example.com", isEnabled: true),
+            Snippet(trigger: sigTrigger, expansion: "Best,\nYour Name", isEnabled: true)
+        ]
+        snippetStore.snippets = samples
     }
 
     // MARK: - Expansion Accounting & Sounds
@@ -805,19 +1167,13 @@ final class AppState: ObservableObject {
 
         // 100th behavior (global)
         if playHundredth && totalSuccessfulExpansions > 0 && totalSuccessfulExpansions % 100 == 0 {
-            if let p = players[.hundred] {
-                p.currentTime = 0
-                p.play()
-            }
+            play(type: .hundred)
             return
         }
 
         // Play the selected default expansion sound (A or B).
         let chosen: SoundType = (defaultExpansionSound == .hundred) ? .b : defaultExpansionSound
-        if let p = players[chosen] {
-            p.currentTime = 0
-            p.play()
-        }
+        play(type: chosen)
     }
 
     // MARK: - Stats utilities

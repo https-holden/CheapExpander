@@ -22,8 +22,41 @@ struct SettingsView: View {
         return parts.isEmpty ? "[]" : "[" + parts.joined(separator: ",") + "]"
     }
 
+    private func normalizeTriggerInput(_ raw: String) -> String {
+        var candidate = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !candidate.isEmpty else { return "" }
+
+        if !candidate.hasPrefix(appState.startDelimiter) {
+            candidate = appState.startDelimiter + candidate
+        }
+
+        return candidate
+    }
+
     var body: some View {
         Form {
+            // Editing controls for staged settings
+            Section {
+                HStack {
+                    Button("Save") {
+                        appState.saveSettingsFromUI()
+                        appState.beginEditingSettings() // prepare a fresh staged snapshot after saving
+                    }
+                    Button("Cancel") {
+                        appState.discardStagedSettings()
+                        appState.beginEditingSettings() // reset staged snapshot to current live values
+                    }
+                    Spacer()
+                    Text(appState.isEditingSettings ? "Editing (not saved)" : "")
+                        .foregroundStyle(.secondary)
+                        .font(.caption)
+                }
+            }
+            .onAppear {
+                // Always start a staged editing session when Settings appears
+                appState.beginEditingSettings()
+            }
+
             Section("Status") {
                 LabeledContent("Enabled") {
                     Text(appState.isEnabled ? "On" : "Off")
@@ -91,7 +124,7 @@ struct SettingsView: View {
                     Text("Snippets")
                         .font(.headline)
                     Spacer()
-                    Button("Add") { appState.snippetStore.add() }
+                    Button("Add") { appState.snippetStore.add(startDelimiter: appState.startDelimiter, endAnchors: appState.endAnchors) }
                 }
 
                 if appState.snippetStore.snippets.isEmpty {
@@ -99,73 +132,136 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 } else {
                     VStack(alignment: .leading, spacing: 10) {
-                        ForEach($appState.snippetStore.snippets) { $snippet in
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack {
-                                    Toggle("", isOn: $snippet.isEnabled)
-                                        .toggleStyle(.switch)
-                                        .labelsHidden()
+                        ForEach(appState.snippetStore.snippets) { item in
+                            if let idx = appState.snippetStore.snippets.firstIndex(where: { $0.id == item.id }) {
+                                let enabledBinding = $appState.snippetStore.snippets[idx].isEnabled
+                                let expansionBinding = $appState.snippetStore.snippets[idx].expansion
 
-                                    TextField("Trigger", text: $snippet.trigger)
-                                        .textFieldStyle(.roundedBorder)
-                                        .frame(width: 140)
+                                VStack(alignment: .leading, spacing: 8) {
+                                    HStack {
+                                        Toggle("", isOn: enabledBinding)
+                                            .toggleStyle(.switch)
+                                            .labelsHidden()
 
-                                    Spacer()
+                                        TextField("Trigger", text: $appState.snippetStore.snippets[idx].trigger)
+                                            .textFieldStyle(.roundedBorder)
+                                            .frame(width: 140)
+                                            .onChange(of: appState.snippetStore.snippets[idx].trigger) { newValue in
+                                                // Normalize asynchronously to avoid mutating during TextField update cycle
+                                                DispatchQueue.main.async {
+                                                    appState.snippetStore.snippets[idx].trigger = normalizeTriggerInput(newValue)
+                                                }
+                                            }
 
-                                    Button(role: .destructive) {
-                                        appState.snippetStore.delete(snippet)
-                                    } label: {
-                                        Text("Delete")
+                                        Spacer()
+
+                                        Button(role: .destructive) {
+                                            if let deleteIdx = appState.snippetStore.snippets.firstIndex(where: { $0.id == item.id }) {
+                                                appState.snippetStore.snippets.remove(at: deleteIdx)
+                                            }
+                                        } label: {
+                                            Text("Delete")
+                                        }
                                     }
-                                }
 
-                                TextEditor(text: $snippet.expansion)
-                                    .font(.system(size: 12, weight: .regular, design: .monospaced))
-                                    .frame(minHeight: 64)
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 6)
-                                            .stroke(.quaternary)
-                                    )
+                                    TextEditor(text: expansionBinding)
+                                        .font(.system(size: 12, weight: .regular, design: .monospaced))
+                                        .frame(minHeight: 64)
+                                        .overlay(
+                                            RoundedRectangle(cornerRadius: 6)
+                                                .stroke(.quaternary)
+                                        )
+                                }
+                                .padding(10)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .fill(.quaternary.opacity(0.25))
+                                )
                             }
-                            .padding(10)
-                            .background(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .fill(.quaternary.opacity(0.25))
-                            )
                         }
                     }
-                    .padding(.top, 6)
+                    HStack {
+                        Spacer()
+                        Button("Reveal Snippets Folder") {
+                            appState.revealAppSupportFolder()
+                        }
+                    }
                 }
 
                 Text("Saved to Application Support as snippets.json")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+                Text("Triggers auto-format to start with \"\(appState.startDelimiter)\" and end with \(String(appState.endAnchors.sorted())) to match expansions.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Sound") {
-                Toggle("Enable sound effects", isOn: $appState.soundEnabled)
-                HStack {
-                    Text("Volume")
-                    Slider(value: $appState.soundVolume, in: 0...100)
-                    Text("\(Int(appState.soundVolume))%")
-                        .frame(width: 40, alignment: .trailing)
-                }
-                Toggle("Play 100th-expansion sound", isOn: $appState.playHundredth)
+                if let _ = appState.stagedSettings {
+                    Toggle("Enable sound effects", isOn: Binding(
+                        get: { appState.stagedSettings?.soundEnabled ?? appState.soundEnabled },
+                        set: { appState.stagedSettings?.soundEnabled = $0 }
+                    ))
+                    HStack {
+                        Text("Volume")
+                        Slider(value: Binding(
+                            get: { appState.stagedSettings?.volume ?? appState.soundVolume },
+                            set: { appState.stagedSettings?.volume = $0 }
+                        ), in: 0...100)
+                        Text("\(Int(appState.stagedSettings?.volume ?? appState.soundVolume))%")
+                            .frame(width: 40, alignment: .trailing)
+                    }
+                    Toggle("Play 100th-expansion sound", isOn: Binding(
+                        get: { appState.stagedSettings?.playHundredth ?? appState.playHundredth },
+                        set: { appState.stagedSettings?.playHundredth = $0 }
+                    ))
 
-                Divider()
+                    Divider()
 
-                Picker("Expansion sound", selection: $appState.defaultExpansionSound) {
-                    Text("Sound A").tag(AppState.SoundType.a)
-                    Text("Sound B").tag(AppState.SoundType.b)
-                }
+                    Picker("Expansion sound", selection: Binding(
+                        get: { appState.stagedSettings?.defaultExpansionSound ?? appState.defaultExpansionSound },
+                        set: { appState.stagedSettings?.defaultExpansionSound = $0 }
+                    )) {
+                        Text("Sound A").tag(AppState.SoundType.a)
+                        Text("Sound B").tag(AppState.SoundType.b)
+                    }
 
-                HStack {
-                    Button("Play") { appState.playTest(appState.defaultExpansionSound) }
-                    Spacer()
-                    Button("Reveal Sounds Folder") { appState.revealSoundsFolder() }
-                    Button("Reset Sounds to Defaults") { appState.resetSoundsToDefaults() }
+                    HStack {
+                        Button("Play") { appState.playTest(appState.stagedSettings?.defaultExpansionSound ?? appState.defaultExpansionSound) }
+                        Spacer()
+                        Button("Reveal Sounds Folder") { appState.revealSoundsFolder() }
+                        Button("Reset Sounds to Defaults") { appState.resetSoundsToDefaults() }
+                    }
+                } else {
+                    // Fallback if no staged settings; display current values read-only
+                    Toggle("Enable sound effects", isOn: .constant(appState.soundEnabled))
+                    HStack {
+                        Text("Volume")
+                        Slider(value: .constant(appState.soundVolume), in: 0...100)
+                        Text("\(Int(appState.soundVolume))%")
+                            .frame(width: 40, alignment: .trailing)
+                    }
+                    Toggle("Play 100th-expansion sound", isOn: .constant(appState.playHundredth))
+
+                    Divider()
+
+                    Picker("Expansion sound", selection: .constant(appState.defaultExpansionSound)) {
+                        Text("Sound A").tag(AppState.SoundType.a)
+                        Text("Sound B").tag(AppState.SoundType.b)
+                    }
+
+                    HStack {
+                        Button("Play") { appState.playTest(appState.defaultExpansionSound) }
+                        Spacer()
+                        Button("Reveal Sounds Folder") { appState.revealSoundsFolder() }
+                        Button("Reset Sounds to Defaults") { appState.resetSoundsToDefaults() }
+                    }
                 }
             }
+
+            Text("Changes to Sound settings are staged until you press Save above.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
 
             Section("Stats") {
                 LabeledContent("Total expansions") { Text("\(appState.totalSuccessfulExpansions)") }
@@ -199,8 +295,15 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
         }
+        .onDisappear {
+            // Ensure we don't leave snippet auto-save suppressed if the view goes away
+            if appState.isEditingSettings {
+                appState.discardStagedSettings()
+            }
+        }
         .formStyle(.grouped)
         .padding(16)
         .frame(minWidth: 420, minHeight: 700)
     }
 }
+
