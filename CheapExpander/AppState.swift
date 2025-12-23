@@ -37,6 +37,8 @@ final class SnippetStore: ObservableObject {
     private var fileMonitor: DispatchSourceFileSystemObject?
     private var fileDescriptor: CInt = -1
     private let fileMonitorQueue = DispatchQueue(label: "SnippetStoreFileMonitor")
+    // Only read/written on fileMonitorQueue
+    private var isSavingFromThisProcess = false
     private var suppressSaveDuringLoad = false
 
     init() {
@@ -66,6 +68,13 @@ final class SnippetStore: ObservableObject {
 
     func save() {
         let url = snippetsFileURL
+        fileMonitorQueue.sync { isSavingFromThisProcess = true }
+        defer {
+            // Clear the flag after the save completes so file events originating from
+            // our own writes don't immediately trigger a reload.
+            fileMonitorQueue.async { self.isSavingFromThisProcess = false }
+        }
+
         do {
             try ensureAppSupportDirectoryExists(for: url)
             let data = try JSONEncoder().encode(snippets)
@@ -113,6 +122,10 @@ final class SnippetStore: ObservableObject {
 
         source.setEventHandler { [weak self] in
             guard let self else { return }
+
+            // Ignore events that originate from our own writes to avoid
+            // reloading while bindings are mutating (which could crash the UI).
+            guard !self.isSavingFromThisProcess else { return }
 
             Task { @MainActor [weak self] in
                 self?.load()
